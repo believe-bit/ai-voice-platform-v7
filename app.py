@@ -59,6 +59,7 @@ app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="http://192.168.1.124:8082", logger=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_MODEL_ROOT = "/data/huangtianle/Ai-Voice-Platform/models/ASR_train_models"
 MODEL_DIR = os.path.join(BASE_DIR, "models", "ASR_train_models")
 UPLOAD_DIR = os.path.join(BASE_DIR, "Uploads")
 OUTPUT_DIR = os.path.join(BASE_DIR, "VITS-fast-fine-tuning", "output")
@@ -79,7 +80,10 @@ USER_DATA_ROOT = Path("/data/huangtianle/Ai-Voice-Platform/object")
 STREAM_ASR_PROC = None          # 子进程句柄
 STREAM_ASR_LOCK = threading.Lock()
 
-
+asr_log_queue = queue.Queue()
+asr_training_process = None
+asr_process_killed = False
+asr_training_thread = None
 
 # 类型映射：英文 → 中文
 TYPE_MAP = {
@@ -231,12 +235,11 @@ try:
 except Exception as e:
     print(f"Error registering font: {str(e)}")
 
+
 training_process = None
-asr_training_process = None
 log_queue = queue.Queue()
 asr_log_queue = queue.Queue()
 training_thread = None
-asr_training_thread = None
 process_killed = False
 asr_process_killed = False
 
@@ -417,7 +420,7 @@ def login():
         return jsonify({'code':400,'msg': '登录异常'}), 400
 
 ###ASR模型微调训练###
-###获取模型
+#获取模型
 @app.route('/api/models', methods=['POST'])
 @cross_origin()
 def get_models():
@@ -428,7 +431,7 @@ def get_models():
         return jsonify({"code":400,"msg": str(e)}), 400
 
 
-###数据集上传
+#数据集上传
 @app.route('/api/asr_finetune_upload', methods=['POST'])
 @cross_origin()
 @require_auth()  # 任意用户登录即可
@@ -475,105 +478,419 @@ def asr_finetune_upload():
         logger.error(f"上传失败: {e}", exc_info=True)
         return jsonify({"code":400,"msg": str(e)}), 400
 
-###ASR模型微调训练
-import re  # 顶部已存在，无需重复添加
-
+# ASR模型微调训练
 @app.route('/api/asr_train', methods=['POST'])
 @cross_origin()
 @require_auth()
 def start_asr_train():
-    data = request.get_json()
-    model_name = data.get('model_name')  # 如 "openai/whisper-small"
-    folder = data.get('folder')          # 如 "1fc62b35"
-    params = data.get('training_params', {})
-
-    if not model_name or not folder:
-        return jsonify({"code": 400, "msg": "缺少 model_name 或 folder"}), 400
-
-    username = request.user['username']
-
-    # 1. 自定义模型保存路径：~/Ai-Voice-Platform/object/username/folder/model/
-    base_model_dir = Path.home() / "Ai-Voice-Platform" / "object" / username / folder / "model"
-    base_model_dir.mkdir(parents=True, exist_ok=True)
-
-    # 2. 自动生成版本号：whisper-small-finetuned-V1, V2, ...
-    pattern = re.compile(r"whisper-small-finetuned-V(\d+)", re.I)
-    existing_versions = []
-    for item in base_model_dir.iterdir():
-        if item.is_dir() and pattern.match(item.name):
-            try:
-                v_num = int(pattern.match(item.name).group(1))
-                existing_versions.append(v_num)
-            except:
-                continue
-
-    next_version = 1
-    if existing_versions:
-        next_version = max(existing_versions) + 1
-
-    model_save_name = f"whisper-small-finetuned-V{next_version}"
-    final_output_dir = base_model_dir / model_save_name
-
-    logger.info(f"训练模型将保存至: {final_output_dir}")
-
-    # 3. 数据集路径
-    dataset_dir = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder / "dataset"
-    if not dataset_dir.exists():
-        return jsonify({"code": 400, "msg": "数据集不存在"}), 400
-
-    # 4. 构建训练命令
-    cmd = [
-        "python", "train.py",
-        "--model_path", model_name,
-        "--data_dir", str(dataset_dir),
-        "--output_dir", str(final_output_dir),  # 关键：传给 train.py
-        "--batch_size", str(params.get("per_device_train_batch_size", 8)),
-        "--gradient_accumulation_steps", str(params.get("gradient_accumulation_steps", 4)),
-        "--num_train_epochs", str(params.get("num_train_epochs", 10)),
-        "--learning_rate", str(params.get("learning_rate", 1e-5)),
-        "--save_steps", str(params.get("save_steps", 500)),
-        "--logging_steps", str(params.get("logging_steps", 100)),
-        "--save_total_limit", str(params.get("save_total_limit", 2)),
-        "--fp16", "true" if params.get("fp16") else "false"
-    ]
+    global asr_training_process, asr_process_killed, asr_log_queue, asr_training_thread
 
     try:
-        # 启动训练
-        proc = subprocess.Popen(
+        data = request.get_json()
+        model_name = data.get('model')
+        folder     = data.get('folder')
+        params     = data.get('training_params', {})
+
+        if not model_name or not folder:
+            return jsonify({"code": 400, "msg": "缺少 model 或 folder"}), 400
+
+        username = request.user.get('username')
+        if not username:
+            return jsonify({"code": 401, "msg": "未登录"}), 401
+
+        # ---------- 模型路径 ----------
+        model_path = Path(LOCAL_MODEL_ROOT) / model_name
+        if not model_path.is_dir():
+            return jsonify({"code": 400, "msg": f"模型文件夹不存在: {model_path}"}), 400
+
+        # ---------- 项目目录 ----------
+        project_root = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder
+        dataset_dir  = project_root / "dataset"
+        if not dataset_dir.is_dir():
+            return jsonify({"code": 400, "msg": "数据集目录不存在"}), 400
+
+        # ---------- 版本化保存路径 ----------
+        base_model_dir = project_root / "model"
+        base_model_dir.mkdir(parents=True, exist_ok=True)
+
+        pattern = re.compile(r"whisper-small-finetuned-V(\d+)", re.I)
+        existing_versions = [
+            int(m.group(1)) for p in base_model_dir.iterdir()
+            if p.is_dir() and (m := pattern.match(p.name))
+        ]
+        next_version = 1 if not existing_versions else max(existing_versions) + 1
+        model_save_name = f"whisper-small-finetuned-V{next_version}"
+        final_output_dir = base_model_dir / model_save_name
+        final_output_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"使用模型: {model_path}")
+        logger.info(f"训练结果保存至: {final_output_dir}")
+
+        # ---------- 构建训练命令 ----------
+        cmd = [
+            "python", "train.py",
+            "--model_path", str(model_path),
+            "--data_dir", str(dataset_dir),
+            "--output_dir", str(final_output_dir),
+            "--batch_size", str(params.get("per_device_train_batch_size", 8)),
+            "--gradient_accumulation_steps", str(params.get("gradient_accumulation_steps", 4)),
+            "--num_train_epochs", str(params.get("num_train_epochs", 10)),
+            "--learning_rate", str(params.get("learning_rate", 1e-5)),
+            "--save_steps", str(params.get("save_steps", 500)),
+            "--logging_steps", str(params.get("logging_steps", 100)),
+            "--save_total_limit", str(params.get("save_total_limit", 2)),
+            "--fp16", "true" if params.get("fp16", True) else "false"
+        ]
+
+        # ---------- 启动子进程（关键：不 wait！） ----------
+        if asr_training_process and asr_training_process.poll() is None:
+            return jsonify({"code": 400, "msg": "已有训练任务"}), 400
+
+        asr_process_killed = False
+        asr_log_queue = queue.Queue()  # 重建队列
+
+        asr_training_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            cwd=BASE_DIR  # 确保在项目根目录运行
+            cwd=BASE_DIR
         )
-        # 可选：保存进程 ID
+
+        # ---------- 实时读取日志线程 ----------
+        def log_reader():
+            try:
+                for line in asr_training_process.stdout:
+                    line = line.strip()
+                    if line:
+                        asr_log_queue.put(f"[ASR训练] {line}")
+                        logger.info(f"[ASR训练] {line}")
+                # 训练结束
+                return_code = asr_training_process.wait()
+                if return_code == 0:
+                    asr_log_queue.put(f"[训练成功] 模型已保存: {final_output_dir}")
+                else:
+                    asr_log_queue.put(f"[训练失败] 退出码: {return_code}")
+            except Exception as e:
+                asr_log_queue.put(f"[读取错误] {e}")
+
+        asr_training_thread = Thread(target=log_reader, daemon=True)
+        asr_training_thread.start()
+
+        # ---------- 立即返回 ----------
         return jsonify({
             "code": 200,
-            "msg": "训练已启动",
+            "msg": "训练已启动（后台运行）",
             "model_save_path": str(final_output_dir),
             "version": f"V{next_version}"
         }), 200
+
     except Exception as e:
-        logger.error(f"训练启动失败: {e}", exc_info=True)
-        return jsonify({"code": 500, "msg": str(e)}), 500
+        logger.error(f"训练启动异常: {e}", exc_info=True)
+        return jsonify({"code": 500, "msg": f"启动失败: {str(e)}"}), 500
+
+# 停止 ASR 微调训练
+@app.route('/api/asr_stop', methods=['POST'])
+@cross_origin()
+@require_auth()
+def stop_asr_training():
+    try:
+        global asr_training_process, asr_process_killed
+
+        # 1. 检查是否有训练任务
+        if not asr_training_process or asr_training_process.poll() is not None:
+            return jsonify({"code": 400, "msg": "没有正在进行的 ASR 训练任务"}), 400
+
+        # 2. 获取 folder（用于删除模型）
+        data = request.get_json() or {}
+        folder = data.get('folder')
+        if not folder:
+            return jsonify({"code": 400, "msg": "缺少 folder 参数"}), 400
+
+        username = request.user['username']
+        project_root = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder
+        base_model_dir = project_root / "model"
+
+        # 3. 终止进程
+        asr_process_killed = True
+        asr_training_process.send_signal(signal.SIGTERM)
+        try:
+            asr_training_process.wait(timeout=5)
+            logger.info("ASR 训练进程已正常终止")
+        except subprocess.TimeoutExpired:
+            asr_training_process.kill()
+            logger.warning("ASR 训练进程强制杀死")
+
+        # 4. 重置全局变量
+        asr_training_process = None
+        asr_training_thread = None
+
+        # 5. 删除未完成的模型目录
+        pattern = re.compile(r"whisper-small-finetuned-V(\d+)", re.I)
+        latest_dir = None
+        latest_v = 0
+        if base_model_dir.exists():
+            for p in base_model_dir.iterdir():
+                if p.is_dir() and (m := pattern.match(p.name)) and int(m.group(1)) > latest_v:
+                    latest_v = int(m.group(1))
+                    latest_dir = p
+            if latest_dir and latest_dir.exists():
+                shutil.rmtree(latest_dir, ignore_errors=True)
+                logger.info(f"已删除未完成模型目录: {latest_dir}")
+
+        # 6. 写日志（统一 synthesis_log.txt）
+        log_msg = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [ASR训练] 用户 {username} 停止训练，folder={folder}\n"
+        with open(os.path.join(BASE_DIR, "synthesis_log.txt"), 'a', encoding='utf-8') as f:
+            f.write(log_msg)
+
+        # 7. 清空日志队列
+        while not asr_log_queue.empty():
+            try: asr_log_queue.get_nowait()
+            except: pass
+
+        return jsonify({
+            "code": 200,
+            "msg": "ASR 训练已停止，未完成模型已删除",
+            "folder": folder,
+            "deleted_model": str(latest_dir) if latest_dir else None
+        }), 200
+
+    except Exception as e:
+        logger.error(f"停止 ASR 训练失败: {e}", exc_info=True)
+        return jsonify({"code": 500, "msg": f"停止失败: {str(e)}"}), 500
+
+# 获取 ASR 训练日志
+@app.route('/api/asr_train_logs', methods=['GET'])
+@cross_origin()
+def stream_asr_training_logs():
+    return Response(stream_asr_logs(), mimetype='text/event-stream')
+
+def stream_logs():
+    try:
+        log_file = os.path.join(BASE_DIR, "train_log.txt")
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] VITS SSE connection established\n")
+        last_heartbeat = time.time()
+        while True:
+            try:
+                log = log_queue.get_nowait()
+                yield f"data: {json.dumps({'message': log})}\n\n"
+                last_heartbeat = time.time()
+            except queue.Empty:
+                if process_killed:
+                    yield f"data: {json.dumps({'message': 'VITS 训练已停止'})}\n\n"
+                    break
+                if time.time() - last_heartbeat > 10:
+                    yield f"data: {json.dumps({'message': 'Heartbeat: Connection alive'})}\n\n"
+                    last_heartbeat = time.time()
+                time.sleep(0.1)
+    except Exception as e:
+        return jsonify({"code":400,"msg": str(e)}), 400
     
 
-# ① 获取模型列表
-@app.route('/api/stream_asr/models', methods=['GET'])
+def stream_asr_logs():
+    try:
+        log_file = os.path.join(BASE_DIR, "train_log.txt")
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ASR SSE connection established\n")
+        last_heartbeat = time.time()
+        while True:
+            try:
+                log = asr_log_queue.get_nowait()
+                yield f"data: {json.dumps({'message': log})}\n\n"
+                last_heartbeat = time.time()
+            except queue.Empty:
+                if asr_process_killed:
+                    yield f"data: {json.dumps({'message': 'ASR 训练已停止'})}\n\n"
+                    break
+                if time.time() - last_heartbeat > 10:
+                    yield f"data: {json.dumps({'message': 'Heartbeat: Connection alive'})}\n\n"
+                    last_heartbeat = time.time()
+                time.sleep(0.1)
+    except Exception as e:
+        return jsonify({"code":400,"msg": str(e)}), 400
+
+
+### 离线音频识别###
+#离线模型检测
+@app.route('/api/offline_models', methods=['POST'])
 @cross_origin()
+@require_auth()
+def get_offline_models():
+    try:
+        folder = request.get_json().get('folder')
+        if not folder:
+            return jsonify({"code": 400, "msg": "缺少 folder 参数"}), 400
+
+        username = request.user.get('username')
+        if not username:
+            return jsonify({"code": 401, "msg": "未登录"}), 401
+
+        model_dir = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder / "model"
+        if not model_dir.is_dir():
+            return jsonify({"code": 404, "msg": "模型目录不存在"}), 404
+
+        models = [f.name for f in model_dir.iterdir() if f.is_dir()]
+        logger.info(f"用户 {username} 查询离线模型: {folder} → {len(models)} 个")
+
+        return jsonify({"code": 200, "models": models}), 200
+
+    except Exception as e:
+        logger.error(f"查询离线模型失败: {e}")
+        return jsonify({"code": 400, "msg": str(e)}), 400
+
+# 离线音频上传
+@app.route('/api/offline_upload_audio', methods=['POST'])
+@cross_origin()
+@require_auth()
+def offline_upload_audio():
+    try:
+        if 'file' not in request.files:
+            return jsonify({"code": 400, "msg": "没有上传文件"}), 400
+
+        file = request.files['file']
+        folder = request.form.get('folder')  # 从 form-data 获取 folder
+
+        if file.filename == '':
+            return jsonify({"code": 400, "msg": "未选择文件"}), 400
+        if not folder:
+            return jsonify({"code": 400, "msg": "缺少 folder 参数"}), 400
+
+        if not allowed_file(file.filename, ALLOWED_AUDIO_EXTENSIONS):
+            return jsonify({"code": 400, "msg": "文件格式不支持，仅支持 .wav"}), 400
+
+        # 获取用户名
+        username = request.user['username']
+
+        # 目标目录
+        upload_dir = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder / "Uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        # 安全文件名 + uuid 防重名
+        filename = secure_filename(file.filename)
+        unique_filename = f"{uuid.uuid4().hex}_{filename}"
+        filepath = upload_dir / unique_filename
+
+        # 保存文件
+        file.save(str(filepath))
+
+        logger.info(f"离线音频上传成功: {username}/{folder}/Uploads/{unique_filename}")
+
+        return jsonify({
+            "code": 200,
+            "msg": "音频上传成功",
+            "audio_path": str(filepath)
+        }), 200
+
+    except Exception as e:
+        logger.error(f"音频上传失败: {e}")
+        return jsonify({"code": 500, "msg": str(e)}), 500
+    
+# 离线音频识别
+@app.route('/api/offline_recognize', methods=['POST'])
+@cross_origin()
+def offline_recognize():
+    try:
+        data = request.get_json()
+        model_name = data.get('model_name')
+        audio_path = data.get('audio_path')
+        
+        if not model_name:
+            return jsonify({"code":400,"msg": "缺少 model_name"}), 400
+        if not audio_path:
+            return jsonify({"code":400,"msg": "缺少 audio_path"}), 400
+        if not os.path.exists(audio_path):
+            return jsonify({"code":400,"msg": "音频文件不存在"}), 400
+        if not os.path.exists(os.path.join(OFFLINE_MODEL_DIR, model_name)):
+            return jsonify({"code":400,"msg": "模型路径不存在"}), 400
+
+        conda_env_path = os.path.join(os.path.expanduser("~"), "anaconda3", "envs", "ASR_train_env")
+        python_executable = os.path.join(conda_env_path, "bin", "python")
+        
+        if not os.path.exists(python_executable):
+            return jsonify({"code":400,"msg": f"Python executable not found: {python_executable}"}), 400
+
+        cmd = [
+            python_executable,
+            os.path.join(BASE_DIR, "test.py"),
+            "--model_path", os.path.join(OFFLINE_MODEL_DIR, model_name),
+            "--audio_path", audio_path
+        ]
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PATH"] = f"{os.path.join(conda_env_path, 'bin')}:{env['PATH']}"
+        env["LD_LIBRARY_PATH"] = f"{os.path.join(conda_env_path, 'lib')}:/usr/lib/x86_64-linux-gnu:{env.get('LD_LIBRARY_PATH', '')}"
+        env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+
+        log_file = os.path.join(BASE_DIR, "offline_recognition_log.txt")
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Executing recognition command: {' '.join(cmd)}\n")
+            sys.stdout.flush()
+
+        try:
+            process = subprocess.run(
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60
+            )
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] STDOUT: {process.stdout}\n")
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] STDERR: {process.stderr}\n")
+                sys.stdout.flush()
+
+            if process.returncode == 0:
+                transcription = process.stdout.strip().split("Transcription:")[-1].strip() if "Transcription:" in process.stdout else ""
+                return jsonify({"transcription": transcription, "raw_output": process.stdout})
+            else:
+                error_msg = f"Recognition failed with exit code {process.returncode}: {process.stderr}"
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
+                return jsonify({"code":400,"msg": error_msg, "raw_output": process.stderr}), 400
+        except subprocess.TimeoutExpired:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Recognition timed out\n")
+            return jsonify({"code":400,"msg": "Recognition timed out"}), 400
+        except Exception as e:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Recognition failed: {str(e)}\n")
+            return jsonify({"code":400,"msg": f"Recognition failed: {str(e)}"}), 400
+    except Exception as e:
+        return jsonify({"code":400,"msg": str(e)}), 400
+
+### 实时流式语音识别 ###
+# 获取模型列表
+@app.route('/api/stream_asr/models', methods=['POST'])
+@cross_origin()
+@require_auth()
 def stream_asr_models():
     try:
-        asr_model_dir = Path(__file__).with_name('models') / 'ASR_models'
-        if not asr_model_dir.exists():
-            return jsonify({'models': []})
-        ms = [d.name for d in asr_model_dir.iterdir() if d.is_dir()]
-        return jsonify({'code':200 ,'msg': '','data':[project_info]}), 200   
-    except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        return jsonify({'code':400,'msg': '模型列表异常'}), 400
+        folder = request.get_json().get('folder')
+        if not folder:
+            return jsonify({"code": 400, "msg": "缺少 folder 参数"}), 400
 
-# ② 启动识别（后台挂起 speed_test.py）
+        username = request.user.get('username')
+        if not username:
+            return jsonify({"code": 401, "msg": "未登录"}), 401
+
+        model_dir = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder / "model"
+        if not model_dir.is_dir():
+            return jsonify({"code": 404, "msg": "模型目录不存在"}), 404
+
+        models = [f.name for f in model_dir.iterdir() if f.is_dir()]
+        logger.info(f"用户 {username} 查询模型: {folder} → {len(models)} 个")
+
+        return jsonify({"code": 200, "models": models}), 200
+
+    except Exception as e:
+        logger.error(f"查询模型失败: {e}")
+        return jsonify({"code": 400, "msg": str(e)}), 400
+
+# 启动识别（后台挂起 speed_test.py）
 @app.route('/api/stream_asr/start', methods=['POST'])
 @cross_origin()
 @require_auth()
@@ -612,13 +929,13 @@ def stream_asr_start():
             # 关键：使用 eventlet 协程安全启动读取任务
             socketio.start_background_task(asr_reader_task)
 
-        return jsonify({'code':200 ,'msg': '','data':[project_info]}), 200
+        return jsonify({'code': 200, 'msg': '语音识别已启动', 'data': []}), 200
 
     except Exception as e:
         logger.error(f"[STREAM-ASR] 启动失败: {str(e)}")
         return jsonify({'code':400,'msg': str(e)}), 400
 
-# ③ 停止识别
+# 停止识别
 @app.route('/api/stream_asr/stop', methods=['POST'])
 @cross_origin()
 @require_auth()
@@ -640,7 +957,7 @@ def stream_asr_stop():
         return jsonify({'code':400,'msg': str(e)}), 400
     
 
-# ④ SSE 推送识别结果（speed_test.py 每输出一行就推）
+# SSE 推送识别结果（speed_test.py 每输出一行就推）
 @app.route('/api/stream_asr/listen', methods=['GET'])
 @cross_origin()
 def stream_asr_listen():
@@ -659,38 +976,10 @@ def stream_asr_listen():
             if ']' in line:
                 text = line.split(']', 1)[-1].strip()
                 yield f"data: {json.dumps({'text': text})}\n\n"
-    return Response(generate(), mimetype="text/event-stream")
+    return Response(generate(), mimetype="text/event-stream")  
 
-
-
-
-
-
-@app.route('/api/upload', methods=['POST'])
-@cross_origin()
-def upload_dataset():
-    try:
-        if 'file' not in request.files:
-            return jsonify({"code":400,"msg": "没有上传文件"}), 400
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({"code":400,"msg": "未选择文件"}), 400
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            upload_path = os.path.join(UPLOAD_DIR, filename)
-            file.save(upload_path)
-            extract_dir = os.path.join(UPLOAD_DIR, os.path.splitext(filename)[0])
-            os.makedirs(extract_dir, exist_ok=True)
-            result = extract_zip(upload_path, extract_dir)
-            if result is True:
-                return jsonify({"message": "数据集上传并解压成功", "dataset_path": extract_dir})
-            else:
-                return jsonify({"code":400,"msg":  f"解压异常: {result}"}), 400
-        return jsonify({"code":400,"msg": "文件格式不支持"}), 400
-    except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
-    
-
+### VITS模型训练 ###
+###上传数据集
 @app.route('/api/upload_vits_dataset', methods=['POST'])
 @cross_origin()
 @require_auth()
@@ -699,14 +988,19 @@ def upload_vits_dataset():
         logger.debug("Received upload_vits_dataset request")
         if 'file' not in request.files:
             logger.error("No file part in request")
-            return jsonify({"code":400,"msg": '没有上传文件'}), 400
+            return jsonify({"code": 400, "msg": "没有上传文件"}), 400
+
         file = request.files['file']
+        folder = request.form.get('folder')          # ← 新增
+        if not folder:
+            return jsonify({"code": 400, "msg": "缺少 folder 参数"}), 400
         if file.filename == '':
             logger.error("No file selected")
-            return jsonify({"code":400,"msg": '未选择文件'}), 400
+            return jsonify({"code": 400, "msg": "未选择文件"}), 400
+
         if file and allowed_file(file.filename, ALLOWED_EXTENSIONS):
             filename = secure_filename(file.filename)
-            name = os.path.splitext(filename)[0]
+            name = os.path.splitext(filename)[0]     # train / dev / ...
             upload_path = os.path.join(UPLOAD_DIR, filename)
             logger.debug(f"Saving file to {upload_path}")
             try:
@@ -714,189 +1008,94 @@ def upload_vits_dataset():
                 os.chmod(upload_path, 0o666)
             except Exception as e:
                 logger.error(f"Error saving file {upload_path}: {str(e)}")
-                return jsonify({"code":400,"msg": f'文件保存失败: {str(e)}'}), 400
+                return jsonify({"code": 400, "msg": f"文件保存失败: {str(e)}"}), 400
 
+            # 临时解压区
             tmp_extract = os.path.join(UPLOAD_DIR, f"{name}_tmp")
             os.makedirs(tmp_extract, exist_ok=True)
-            try:
-                os.chmod(tmp_extract, 0o766)
-            except PermissionError as e:
-                logger.warning(f"Unable to set permissions for {tmp_extract}: {str(e)}")
-
-            logger.debug(f"Extracting ZIP to {tmp_extract}")
             result = extract_zip(upload_path, tmp_extract)
             if result is not True:
                 shutil.rmtree(tmp_extract, ignore_errors=True)
                 logger.error(f"Extraction failed: {result}")
-                return jsonify({"code":400,"msg":f'解压失败: {result}'}), 400
+                return jsonify({"code": 400, "msg": f"解压失败: {result}"}), 400
 
-            target_base = VITS_BASE
-            os.makedirs(target_base, exist_ok=True)
-            try:
-                os.chmod(target_base, 0o766)
-            except PermissionError as e:
-                logger.warning(f"Unable to set permissions for {target_base}: {str(e)}")
+            # 全新目标路径：object/<username>/<folder>/dataset/<name>/
+            username = request.user['username']
+            target_dir = Path(BASE_DIR) / "object" / username / secure_filename(folder) / "dataset" / name
+            target_dir.mkdir(parents=True, exist_ok=True)
 
-            logger.debug(f"Clearing old contents in {target_base}")
-            for entry in os.listdir(target_base):
-                path = os.path.join(target_base, entry)
-                try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
-                except Exception as e:
-                    logger.warning(f"无法删除 {path}: {e}")
+            # 清空旧内容（可选）
+            for item in target_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
 
-            target_dir = os.path.join(target_base, name)
-            if os.path.exists(target_dir):
-                shutil.rmtree(target_dir, ignore_errors=True)
-            os.makedirs(target_dir, exist_ok=True)
-            try:
-                os.chmod(target_dir, 0o766)
-            except PermissionError as e:
-                logger.warning(f"Unable to set permissions for {target_dir}: {str(e)}")
-
-            logger.debug(f"Moving files from {tmp_extract} to {target_dir}")
+            # 把临时内容移过去
             for item in os.listdir(tmp_extract):
                 s = os.path.join(tmp_extract, item)
-                d = os.path.join(target_dir, item)
-                try:
-                    shutil.move(s, d)
-                except Exception as e:
-                    logger.error(f"Error moving {s} to {d}: {str(e)}")
-                    shutil.rmtree(tmp_extract, ignore_errors=True)
-                    return jsonify({"code":400,"msg":f'文件移动失败: {str(e)}'}), 400
+                d = target_dir / item
+                shutil.move(s, str(d))
             shutil.rmtree(tmp_extract, ignore_errors=True)
 
-            subfolders = sorted([d for d in os.listdir(target_dir) if os.path.isdir(os.path.join(target_dir, d))])
-            debug_info = {
-                'top_level': sorted(os.listdir(target_dir)),
-                'subfolders': {}
-            }
-
-            logger.debug(f"Processing subfolders: {subfolders}")
-            train_lines = []
-            val_lines = []
+            # 以下逻辑与原接口相同，只是路径换成 target_dir
+            subfolders = sorted([d for d in target_dir.iterdir() if d.is_dir()])
+            train_lines, val_lines = [], []
 
             for idx, sub in enumerate(subfolders):
-                sub_path = os.path.join(target_dir, sub)
-                wavs = sorted([f for f in os.listdir(sub_path) if f.lower().endswith('.wav')])
-                txts = sorted([f for f in os.listdir(sub_path) if f.lower().endswith(('.txt', '.lab', '.text'))])
-                debug_info['subfolders'][sub] = {'wav_count': len(wavs), 'txt_count': len(txts)}
+                sub_path = target_dir / sub
+                wavs = sorted(sub_path.glob("*.wav"))
+                txts = sorted(sub_path.glob("*.txt")) + sorted(sub_path.glob("*.lab")) + sorted(sub_path.glob("*.text"))
 
                 pairs = []
-                missing_txt = []
                 for wav in wavs:
-                    base = os.path.splitext(wav)[0]
-                    txt_path = os.path.join(sub_path, base + '.txt')
-                    if not os.path.exists(txt_path):
-                        for ext in ['.lab', '.text']:
-                            if os.path.exists(os.path.join(sub_path, base + ext)):
-                                txt_path = os.path.join(sub_path, base + ext)
-                                break
-                    if not os.path.exists(txt_path):
-                        missing_txt.append(wav)
+                    base = wav.stem
+                    txt = next((t for t in txts if t.stem == base), None)
+                    if txt is None:
                         continue
-
-                    try:
-                        with open(txt_path, 'r', encoding='utf-8') as f:
-                            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
-                        text_line = lines[1] if len(lines) > 1 else (lines[0] if lines else '')
-                    except Exception as e:
-                        logger.error(f"Error reading {txt_path}: {str(e)}")
-                        text_line = ''
-                    rel_path = f"./dataset/{name}/{sub}/{wav}"
+                    text_line = txt.read_text(encoding="utf-8").strip().splitlines()
+                    text_line = text_line[1] if len(text_line) > 1 else (text_line[0] if text_line else "")
+                    rel_path = f"./dataset/{name}/{sub.name}/{wav.name}"
                     pairs.append((rel_path, str(idx), text_line))
-
-                debug_info['subfolders'][sub]['missing_txt'] = missing_txt
 
                 n = len(pairs)
                 if n == 0:
                     continue
                 split = int(n * 0.9)
-                if split < 1:
-                    split = n - 1 if n > 1 else 1
-                for i, item in enumerate(pairs):
-                    line = '|'.join(item)
-                    if i < split:
-                        train_lines.append(line)
-                    else:
-                        val_lines.append(line)
+                for i, (rel, spk, txt) in enumerate(pairs):
+                    line = f"{rel}|{spk}|{txt}"
+                    (train_lines if i < split else val_lines).append(line)
 
             if not train_lines and not val_lines:
-                logger.error("No valid wav-txt pairs found")
-                return jsonify({"code":400,"msg": '未找到有效的 wav-txt 配对样本', 'debug': debug_info}), 400
+                return jsonify({"code": 400, "msg": "未找到有效的 wav-txt 配对样本"}), 400
 
-            train_file = os.path.join(target_base, f"{name}_train.txt")
-            val_file = os.path.join(target_base, f"{name}_val.txt")
-            logger.debug(f"Writing train file: {train_file}")
-            try:
-                with open(train_file, 'w', encoding='utf-8') as f:
-                    for ln in train_lines:
-                        f.write(ln + '\n')
-                with open(val_file, 'w', encoding='utf-8') as f:
-                    for ln in val_lines:
-                        f.write(ln + '\n')
-            except Exception as e:
-                logger.error(f"Error writing train/val files: {str(e)}")
-                return jsonify({"code":400,"msg": f'写入 train/val 文件异常: {str(e)}', 'debug': debug_info}), 400
+            train_file = target_dir / f"{name}_train.txt"
+            val_file   = target_dir / f"{name}_val.txt"
+            train_file.write_text("\n".join(train_lines) + "\n", encoding="utf-8")
+            val_file.write_text("\n".join(val_lines) + "\n", encoding="utf-8")
 
-            def generate_symbols(train_file_path, val_file_path):
-                symbols = set()
-                for file_path in [train_file_path, val_file_path]:
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                parts = line.strip().split('|')
-                                if len(parts) < 3:
-                                    continue
-                                text = parts[2].strip()
-                                if not text:
-                                    continue
-                                tokens = text.split()
-                                for t in tokens:
-                                    if t:
-                                        symbols.add(t)
-                    except Exception as e:
-                        logger.error(f"Error reading {file_path} for symbols: {str(e)}")
-                        continue
-                return sorted(list(symbols))
+            # 生成符号表
+            symbols = sorted({t for line in train_lines + val_lines for t in line.split("|")[2].split()})
+            symbols_file = target_dir / f"{name}_symbols.txt"
+            symbols_file.write_text("[\n" + ",\n".join(f'  "{s}"' for s in symbols) + "\n]\n", encoding="utf-8")
 
-            symbols = generate_symbols(train_file, val_file)
-            symbols_file = os.path.join(target_base, f"{name}_symbols.txt")
-            logger.debug(f"Writing symbols file: {symbols_file}")
-            try:
-                with open(symbols_file, 'w', encoding='utf-8') as f:
-                    f.write('[\n')
-                    for i, s in enumerate(symbols):
-                        comma = ',' if i != len(symbols) - 1 else ''
-                        f.write(f'  "{s}"{comma}\n')
-                    f.write(']\n')
-            except Exception as e:
-                logger.error(f"Error writing symbols file: {str(e)}")
-                return jsonify({"code":400,"msg": f'写入 symbols 文件异常: {str(e)}', 'debug': debug_info}), 400
-
-            logger.info(f"Dataset uploaded: {target_dir}")
+            logger.info(f"VITS 数据集已处理：{target_dir}")
             return jsonify({
-                'message': '上传并处理成功',
-                'dataset_name': name,
-                'dataset_dir': os.path.abspath(target_dir),
-                'train_file': os.path.abspath(train_file),
-                'val_file': os.path.abspath(val_file),
-                'symbols_file': os.path.abspath(symbols_file),
-                'debug': debug_info
-            })
+                "message": "上传并处理成功",
+                "dataset_name": name,
+                "dataset_dir": str(target_dir),
+                "train_file": str(train_file),
+                "val_file": str(val_file),
+                "symbols_file": str(symbols_file),
+            }), 200
+
         logger.error(f"File type not allowed: {file.filename}")
-        return jsonify({"code":400,"msg":'文件格式不支持，需为 zip'}), 400
+        return jsonify({"code": 400, "msg": "文件格式不支持，需为 zip"}), 400
     except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
+        logger.exception("upload_vits_dataset error")
+        return jsonify({"code": 500, "msg": str(e)}), 500
     
-
-
-    
-# ==============================================================================
-
+### 确认VITS参数
 @app.route('/api/confirm_vits_params', methods=['POST'])
 @cross_origin()
 def confirm_vits_params():
@@ -995,38 +1194,52 @@ def confirm_vits_params():
     except Exception as e:
         return jsonify({"code":400,"msg": str(e)}), 400
     
-
+### 训练VITS模型
 @app.route('/api/train_vits', methods=['POST'])
 @cross_origin()
 @require_auth()
 def train_vits_model():
     try:
         global training_process, process_killed, training_thread
+
         data = request.get_json()
-        model_save_path = data.get('model_save_path')
-        config_path = data.get('config_path')
+        folder = data.get('folder')          # 必需：项目目录
+        config_path = data.get('config_path')  # 必需：由 /api/confirm_vits_params 返回
         preserved = data.get('preserved', 2)
 
-        if not model_save_path:
-            return jsonify({"code":400,"msg": "缺少 model_save_path"}), 400
-        if not config_path:
-            return jsonify({"code":400,"msg": "缺少 config_path"}), 400
+        # ---------- 1. 参数校验 ----------
+        if not folder or not config_path:
+            return jsonify({"code": 400, "msg": "缺少 folder 或 config_path"}), 400
         if not os.path.exists(config_path):
-            return jsonify({"code":400,"msg": "配置文件不存在，请先确认参数"}), 400
+            return jsonify({"code": 400, "msg": "配置文件不存在，请先确认参数"}), 400
 
+        # ---------- 2. 自动生成版本号模型目录 ----------
+        username = request.user['username']
+        project_root = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder
+        base_model_dir = project_root / "model"
+        base_model_dir.mkdir(parents=True, exist_ok=True)
+
+        pattern = re.compile(r"OUTPUT_MODEL-v(\d+)", re.I)
+        existing_versions = [
+            int(m.group(1)) for p in base_model_dir.iterdir()
+            if p.is_dir() and (m := pattern.match(p.name))
+        ]
+        next_version = 1 if not existing_versions else max(existing_versions) + 1
+        model_save_path = base_model_dir / f"OUTPUT_MODEL-v{next_version}"
+        model_save_path.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"[VITS] 训练结果将保存至：{model_save_path}")
+
+        # ---------- 3. 组装训练命令 ----------
         conda_env_path = os.path.join(os.path.expanduser("~"), "anaconda3", "envs", "VITS_train_env")
         python_executable = os.path.join(conda_env_path, "bin", "python")
-
         if not os.path.exists(python_executable):
-            error_msg = f"Python executable not found: {python_executable}"
-            with open(os.path.join(BASE_DIR, "train_log.txt"), 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR: {error_msg}\n")
-            return jsonify({"code":400,"msg": error_msg}), 400
+            return jsonify({"code": 400, "msg": f"Python 可执行文件未找到: {python_executable}"}), 400
 
         cmd = [
             python_executable,
             os.path.join(BASE_DIR, "VITS-fast-fine-tuning", "finetune_speaker_v3.py"),
-            "-m", model_save_path,
+            "-m", str(model_save_path),
             "--drop_speaker_embed", "True",
             "-c", config_path,
             "--preserved", str(preserved)
@@ -1038,35 +1251,27 @@ def train_vits_model():
         env["LD_LIBRARY_PATH"] = f"{os.path.join(conda_env_path, 'lib')}:/usr/lib/x86_64-linux-gnu:{env.get('LD_LIBRARY_PATH', '')}"
         env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
+        # ---------- 4. 日志文件 ----------
         log_file = os.path.join(BASE_DIR, "train_log.txt")
         with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Executing command: {' '.join(cmd)}\n")
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Environment PATH: {env['PATH']}\n")
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Environment LD_LIBRARY_PATH: {env['LD_LIBRARY_PATH']}\n")
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Environment CUDA_VISIBLE_DEVICES: {env['CUDA_VISIBLE_DEVICES']}\n")
-            sys.stdout.flush()
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] VITS 训练命令：{' '.join(cmd)}\n")
 
-        def run_training():
-            global training_process, process_killed
+        # ---------- 5. 如已有训练，先终止 ----------
+        if training_process and training_process.poll() is None:
+            process_killed = True
+            training_process.terminate()
             try:
-                test_cmd = [python_executable, "-c", "import sys, torch, torio; print('Test: Python version: %s, CUDA: %s, FFmpeg: %s' % (sys.version, torch.cuda.is_available(), torio._extension._FFMPEG_EXT_LOADED)); sys.stdout.flush()"]
-                test_process = subprocess.run(
-                    test_cmd,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=10
-                )
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Test command STDOUT: {test_process.stdout}\n")
-                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Test command STDERR: {test_process.stderr}\n")
-                    if test_process.returncode != 0:
-                        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Test command failed with exit code {test_process.returncode}\n")
-                log_queue.put(f"Test command output: {test_process.stdout.strip()}")
-                if test_process.stderr:
-                    log_queue.put(f"Test command error: {test_process.stderr.strip()}")
+                training_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                training_process.kill()
+            training_process = None
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 已终止上一次训练\n")
 
+        # ---------- 6. 启动后台训练 ----------
+        def run_training():
+            global training_process
+            try:
                 training_process = subprocess.Popen(
                     cmd,
                     env=env,
@@ -1074,12 +1279,10 @@ def train_vits_model():
                     stderr=subprocess.PIPE,
                     text=True,
                     bufsize=1,
-                    universal_newlines=True,
                     cwd=os.path.join(BASE_DIR, "VITS-fast-fine-tuning")
                 )
                 with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Training process started with PID: {training_process.pid}\n")
-                    sys.stdout.flush()
+                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 训练进程 PID: {training_process.pid}\n")
 
                 from select import select
                 while training_process.poll() is None:
@@ -1090,52 +1293,43 @@ def train_vits_model():
                             log_queue.put(line)
                             with open(log_file, 'a', encoding='utf-8') as f:
                                 f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {'STDOUT' if pipe == training_process.stdout else 'STDERR'}: {line}\n")
-                    sys.stdout.flush()
+                    time.sleep(0.01)
+
+                # 收集剩余输出
                 for line in training_process.stdout:
                     if line.strip():
                         log_queue.put(line.strip())
-                        with open(log_file, 'a', encoding='utf-8') as f:
-                            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] STDOUT: {line.strip()}\n")
                 for line in training_process.stderr:
                     if line.strip():
                         log_queue.put(line.strip())
-                        with open(log_file, 'a', encoding='utf-8') as f:
-                            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] STDERR: {line.strip()}\n")
-                training_process.wait()
+
                 return_code = training_process.returncode
                 if return_code == 0 and not process_killed:
-                    success_msg = f"Training completed, model saved to {model_save_path}"
-                    log_queue.put(success_msg)
-                    with open(log_file, 'a', encoding='utf-8') as f:
-                        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {success_msg}\n")
+                    msg = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 训练完成，模型已保存：{model_save_path}"
+                    log_queue.put(msg)
                 else:
-                    error_msg = f"Training failed with exit code {return_code}"
-                    log_queue.put(error_msg)
-                    with open(log_file, 'a', encoding='utf-8') as f:
-                        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
-            except Exception as e:
-                error_msg = f"Training failed: {str(e)}"
-                log_queue.put(error_msg)
+                    msg = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 训练失败，退出码：{return_code}"
+                    log_queue.put(msg)
                 with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
-                sys.stdout.flush()
+                    f.write(msg + '\n')
+            except Exception as e:
+                err_msg = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 训练异常：{e}"
+                log_queue.put(err_msg)
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(err_msg + '\n')
 
-        if training_process and training_process.poll() is None:
-            process_killed = True
-            training_process.terminate()
-            try:
-                training_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                training_process.kill()
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Previous training process terminated\n")
-            training_process = None
-
-        training_thread = Thread(target=run_training)
+        training_thread = Thread(target=run_training, daemon=True)
         training_thread.start()
-        return jsonify({"message": "训练已开始"})
+
+        return jsonify({
+            "message": "训练已开始",
+            "model_save_path": str(model_save_path),
+            "version": f"v{next_version}"
+        }), 200
+
     except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
+        logger.exception("train_vits_model error")
+        return jsonify({"code": 500, "msg": str(e)}), 400
 
 
 def stream_logs():
@@ -1161,7 +1355,7 @@ def stream_logs():
     except Exception as e: 
         return jsonify({"code":400,"msg": str(e)}), 400
     
-
+# 停止VITS训练
 @app.route('/api/stop', methods=['POST'])
 @cross_origin()
 def stop_training():
@@ -1186,12 +1380,13 @@ def stop_training():
     except Exception as e:
         return jsonify({"code":400,"msg": str(e)}), 400
     
-
+# 获取VITS训练日志
 @app.route('/api/train', methods=['GET'])
 @cross_origin()
 def stream_training_logs():
     return Response(stream_logs(), mimetype='text/event-stream')
 
+####
 @app.route('/api/outputs/<path:filename>', methods=['GET'])
 @cross_origin()
 def download_output():
@@ -1257,195 +1452,69 @@ def recognize_audio():
     except Exception as e:
         return jsonify({"code":400,"msg": str(e)}), 400
     
+###
 
-# 只给 ASR 微调用，保存到 Uploads/asr 目录
 
 
-@app.route('/api/asr_train_logs', methods=['GET'])
+    
+
+
+    
+
+
+
+    
+
+###语言合成###
+# 获取合成模型列表
+@app.route('/api/synthesize_models', methods=['POST'])
 @cross_origin()
-def stream_asr_training_logs():
-    print("【DEBUG】接收到的 data =", data)
-    return Response(stream_asr_logs(), mimetype='text/event-stream')
-
-def stream_logs():
+@require_auth()
+def speech_synthesize_models():
     try:
-        log_file = os.path.join(BASE_DIR, "train_log.txt")
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] VITS SSE connection established\n")
-        last_heartbeat = time.time()
-        while True:
-            try:
-                log = log_queue.get_nowait()
-                yield f"data: {json.dumps({'message': log})}\n\n"
-                last_heartbeat = time.time()
-            except queue.Empty:
-                if process_killed:
-                    yield f"data: {json.dumps({'message': 'VITS 训练已停止'})}\n\n"
-                    break
-                if time.time() - last_heartbeat > 10:
-                    yield f"data: {json.dumps({'message': 'Heartbeat: Connection alive'})}\n\n"
-                    last_heartbeat = time.time()
-                time.sleep(0.1)
+        req      = request.get_json() or {}
+        folder   = req.get('folder')
+        expand   = req.get('expand', False)          # 是否展开 G_*.pth
+        if not folder:
+            return jsonify({"code": 400, "msg": "缺少 folder 参数"}), 400
+
+        username = request.user.get('username')
+        if not username:
+            return jsonify({"code": 401, "msg": "未登录"}), 401
+
+        model_dir = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder / "model"
+        if not model_dir.is_dir():
+            return jsonify({"code": 404, "msg": "模型目录不存在"}), 404
+
+        models = []
+        details = {} if expand else None
+
+        # 一级子目录
+        for sub in model_dir.iterdir():
+            if not sub.is_dir():
+                continue
+            # 二级扫描：G_*.pth
+            g_files = [
+                f.name for f in sub.iterdir()
+                if f.is_file() and f.name.startswith("G_") and f.suffix.lower() == ".pth"
+            ]
+            if not g_files:              # 没有合法权重则跳过该目录
+                continue
+            models.append(sub.name)
+            if expand:
+                details[sub.name] = g_files   # 目录 -> [G_xxx.pth, ...]
+
+        logger.info(f"用户 {username} 查询可合成模型: {folder} → {len(models)} 个")
+        resp = {"code": 200, "models": models}
+        if expand:
+            resp["details"] = details
+        return jsonify(resp), 200
+
     except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
-    
+        logger.error(f"查询可合成模型失败: {e}")
+        return jsonify({"code": 500, "msg": str(e)}), 500
 
-def stream_asr_logs():
-    try:
-        log_file = os.path.join(BASE_DIR, "train_log.txt")
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ASR SSE connection established\n")
-        last_heartbeat = time.time()
-        while True:
-            try:
-                log = asr_log_queue.get_nowait()
-                yield f"data: {json.dumps({'message': log})}\n\n"
-                last_heartbeat = time.time()
-            except queue.Empty:
-                if asr_process_killed:
-                    yield f"data: {json.dumps({'message': 'ASR 训练已停止'})}\n\n"
-                    break
-                if time.time() - last_heartbeat > 10:
-                    yield f"data: {json.dumps({'message': 'Heartbeat: Connection alive'})}\n\n"
-                    last_heartbeat = time.time()
-                time.sleep(0.1)
-    except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
-    
-
-
-    
-
-@app.route('/api/asr_stop', methods=['POST'])
-@cross_origin()
-def stop_asr_training():
-    try:
-        global asr_training_process, asr_process_killed
-        if asr_training_process and asr_training_process.poll() is None:
-            asr_process_killed = True
-            asr_training_process.send_signal(signal.SIGTERM)
-            try:
-                asr_training_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                asr_training_process.kill()
-            asr_training_process = None
-            asr_training_thread = None  # 重置线程
-            log_file = os.path.join(BASE_DIR, "train_log.txt")
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ASR training stopped by user\n")
-            # 清空 ASR 日志队列
-            while not asr_log_queue.empty():
-                asr_log_queue.get()
-            return jsonify({"message": "ASR 训练已停止"})
-        return jsonify({"code":400,"msg": "没有正在进行的 ASR 训练任务"}), 400
-    except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
-    
-### 模型测试
-@app.route('/api/offline_models', methods=['GET'])
-@cross_origin()
-def get_offline_models():
-    try:
-        models = [f for f in os.listdir(OFFLINE_MODEL_DIR) if os.path.isdir(os.path.join(OFFLINE_MODEL_DIR, f))]
-        return jsonify({"models": models})
-    except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
-
-@app.route('/api/offline_upload_audio', methods=['POST'])
-@cross_origin()
-def offline_upload_audio():
-    try:
-        if 'file' not in request.files:
-            return jsonify({"code":400,"msg": "没有上传文件"}), 400
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({"code":400,"msg": "未选择文件"}), 400
-        if file and allowed_file(file.filename, ALLOWED_AUDIO_EXTENSIONS):
-            filename = secure_filename(file.filename)
-            upload_path = os.path.join(OFFLINE_UPLOAD_DIR, f"{uuid.uuid4().hex}_{filename}")
-            file.save(upload_path)
-            return jsonify({"message": "音频上传成功", "audio_path": upload_path})
-        return jsonify({"code":400,"msg": "文件格式不支持，仅支持 .wav"}), 400
-    except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
-    
-
-@app.route('/api/offline_recognize', methods=['POST'])
-@cross_origin()
-def offline_recognize():
-    try:
-        data = request.get_json()
-        model_name = data.get('model_name')
-        audio_path = data.get('audio_path')
-        
-        if not model_name:
-            return jsonify({"code":400,"msg": "缺少 model_name"}), 400
-        if not audio_path:
-            return jsonify({"code":400,"msg": "缺少 audio_path"}), 400
-        if not os.path.exists(audio_path):
-            return jsonify({"code":400,"msg": "音频文件不存在"}), 400
-        if not os.path.exists(os.path.join(OFFLINE_MODEL_DIR, model_name)):
-            return jsonify({"code":400,"msg": "模型路径不存在"}), 400
-
-        conda_env_path = os.path.join(os.path.expanduser("~"), "anaconda3", "envs", "ASR_train_env")
-        python_executable = os.path.join(conda_env_path, "bin", "python")
-        
-        if not os.path.exists(python_executable):
-            return jsonify({"code":400,"msg": f"Python executable not found: {python_executable}"}), 400
-
-        cmd = [
-            python_executable,
-            os.path.join(BASE_DIR, "test.py"),
-            "--model_path", os.path.join(OFFLINE_MODEL_DIR, model_name),
-            "--audio_path", audio_path
-        ]
-
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        env["PATH"] = f"{os.path.join(conda_env_path, 'bin')}:{env['PATH']}"
-        env["LD_LIBRARY_PATH"] = f"{os.path.join(conda_env_path, 'lib')}:/usr/lib/x86_64-linux-gnu:{env.get('LD_LIBRARY_PATH', '')}"
-        env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-
-        log_file = os.path.join(BASE_DIR, "offline_recognition_log.txt")
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Executing recognition command: {' '.join(cmd)}\n")
-            sys.stdout.flush()
-
-        try:
-            process = subprocess.run(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=60
-            )
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] STDOUT: {process.stdout}\n")
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] STDERR: {process.stderr}\n")
-                sys.stdout.flush()
-
-            if process.returncode == 0:
-                transcription = process.stdout.strip().split("Transcription:")[-1].strip() if "Transcription:" in process.stdout else ""
-                return jsonify({"transcription": transcription, "raw_output": process.stdout})
-            else:
-                error_msg = f"Recognition failed with exit code {process.returncode}: {process.stderr}"
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
-                return jsonify({"code":400,"msg": error_msg, "raw_output": process.stderr}), 400
-        except subprocess.TimeoutExpired:
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Recognition timed out\n")
-            return jsonify({"code":400,"msg": "Recognition timed out"}), 400
-        except Exception as e:
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Recognition failed: {str(e)}\n")
-            return jsonify({"code":400,"msg": f"Recognition failed: {str(e)}"}), 400
-    except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
-    
-
-###语言合成
+# 获取自定义语言列表
 @app.route('/api/custom_languages', methods=['GET'])
 @cross_origin()
 def get_custom_languages():
@@ -1456,6 +1525,7 @@ def get_custom_languages():
     except Exception as e:
         return jsonify({"code":400,"msg": f"获取语言列表失败: {str(e)}"}), 400
 
+# 添加删除自定义语言
 @app.route('/api/save_language', methods=['POST'])
 @cross_origin()
 def save_custom_language():
@@ -1493,112 +1563,133 @@ def save_custom_language():
     except Exception as e:
         return jsonify({"code":400,"msg": f"保存语言失败: {str(e)}"}), 400
     
-
+# 合成
 @app.route('/api/synthesize_speech', methods=['POST'])
 @cross_origin()
+@require_auth()                     # 保持鉴权
 def synthesize_speech():
+    """
+    必须显式指定 model_pth，不再自动挑选权重文件。
+    合成音频保存到：
+        ~/Ai-Voice-Platform/object/<username>/<folder>/output/<uuid>.wav
+    返回的 audio_url 为：
+        /user_outputs/<username>/<folder>/<uuid>.wav
+    """
     try:
-        if 'model' not in request.files or 'config' not in request.files:
-            return jsonify({"code":400,"msg": "缺少模型文件或配置文件"}), 400
-        model_file = request.files['model']
-        config_file = request.files['config']
-        language = request.form.get('language')
-        text = request.form.get('text')
-        speaker = request.form.get('speaker', '0')
-        length_scale = request.form.get('length_scale', '1.0')
-        noise_scale = request.form.get('noise_scale', '0.3')
-        noise_scale_w = request.form.get('noise_scale_w', '0.5')
-        use_pinyin = request.form.get('use_pinyin', 'false').lower() == 'true'
-        pitch_factor = float(request.form.get('pitch_factor', '1.0'))
+        # ---------- 1. 统一取参 ----------
+        if request.content_type and 'application/json' in request.content_type:
+            data = request.get_json()          # JSON
+        else:
+            data = request.form                # form-data
 
-        if not language or not text:
-            return jsonify({"code":400,"msg": "缺少语言或合成文本"}), 400
-        if not model_file.filename or not config_file.filename:
-            return jsonify({"code":400,"msg": "未选择模型文件或配置文件"}), 400
-        if not allowed_file(model_file.filename, {'pth'}) or not allowed_file(config_file.filename, {'json'}):
-            return jsonify({"code":400,"msg": "文件格式不支持，仅支持 .pth 和 .json"}), 400
+        folder       = data.get('folder')
+        model_dir    = data.get('model_dir')
+        model_pth    = data.get('model_pth')      # 必须显式给
+        language     = data.get('language')
+        text         = data.get('text')
+        speaker      = data.get('speaker', '0')
+        length_scale = data.get('length_scale', '1.0')
+        noise_scale  = data.get('noise_scale', '0.3')
+        noise_scale_w = data.get('noise_scale_w', '0.5')
+        use_pinyin   = str(data.get('use_pinyin', 'false')).lower() == 'true'
+        pitch_factor = float(data.get('pitch_factor', 1.0))
 
-        # 保存上传的文件
-        model_filename = secure_filename(model_file.filename)
-        config_filename = secure_filename(config_file.filename)
-        model_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{model_filename}")
-        config_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{config_filename}")
-        model_file.save(model_path)
-        config_file.save(config_path)
+        # ---------- 2. 必填校验 ----------
+        if not all([folder, model_dir, model_pth, language, text]):
+            return jsonify({"code": 400, "msg": "缺少必填参数：folder / model_dir / model_pth / language / text"}), 400
 
-        inference_script = os.path.join(VITS_INFERENCE_DIR, f"{language}_inference.py")
-        if not os.path.exists(inference_script):
-            return jsonify({"code":400,"msg": f"推理脚本 {language}_inference.py 不存在"}), 400
+        # ---------- 3. 取得当前登录用户 ----------
+        username = request.user['username']
 
-        conda_env_path = os.path.join(os.path.expanduser("~"), "anaconda3", "envs", "VITS_train_env")
-        python_executable = os.path.join(conda_env_path, "bin", "python")
+        # ---------- 4. 构建 **用户专属** 输出目录 ----------
+        user_output_dir = USER_DATA_ROOT / username / folder / "output"
+        user_output_dir.mkdir(parents=True, exist_ok=True)   # 自动创建
 
-        if not os.path.exists(python_executable):
-            return jsonify({"code":400,"msg": f"Python 可执行文件未找到: {python_executable}"}), 400
-
-        unique_id = str(uuid.uuid4())[:8]
+        # ---------- 5. 生成唯一文件名 ----------
         output_filename = f"{uuid.uuid4().hex}.wav"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        output_path = user_output_dir / output_filename
+
+        # ---------- 6. 定位模型 & config ----------
+        model_root   = USER_DATA_ROOT / username / folder / "model"
+        model_path   = model_root / model_dir
+        model_file   = model_path / model_pth
+        config_json  = model_path / 'config.json'
+
+        if not model_path.is_dir():
+            return jsonify({"code": 404, "msg": f"模型目录不存在：{model_path}"}), 404
+        if not model_file.is_file():
+            return jsonify({"code": 404, "msg": f"权重文件不存在：{model_file}"}), 404
+        if not config_json.is_file():
+            return jsonify({"code": 404, "msg": f"缺少 config.json：{config_json}"}), 404
+
+        # ---------- 7. 推理脚本 ----------
+        inference_script = Path(VITS_INFERENCE_DIR) / f"{language}_inference.py"
+        if not inference_script.is_file():
+            return jsonify({"code": 404, "msg": f"语言推理脚本不存在：{inference_script}"}), 404
+
+        # ---------- 8. 合成命令 ----------
+        conda_env_path = Path.home() / "anaconda3" / "envs" / "VITS_train_env"
+        python_exe = conda_env_path / "bin" / "python"
+        if not python_exe.is_file():
+            return jsonify({"code": 500, "msg": "未找到 VITS_train_env 环境"}), 500
 
         cmd = [
-            python_executable,
-            inference_script,
-            "-m", model_path,
-            "-c", config_path,
+            str(python_exe), str(inference_script),
+            "-m", str(model_file),
+            "-c", str(config_json),
             "-t", text,
             "-s", speaker,
             "-l", language,
             "-ls", str(length_scale),
             "--noise_scale", str(float(noise_scale) * pitch_factor),
             "--noise_scale_w", str(float(noise_scale_w) * pitch_factor),
-            "--output", output_path
+            "--output", str(output_path)          # 关键：把路径传给脚本
         ]
         if use_pinyin:
             cmd.append("--use_pinyin")
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        env["PATH"] = f"{os.path.join(conda_env_path, 'bin')}:{env['PATH']}"
-        env["LD_LIBRARY_PATH"] = f"{os.path.join(conda_env_path, 'lib')}:/usr/lib/x86_64-linux-gnu:{env.get('LD_LIBRARY_PATH', '')}"
+        env["PATH"] = f"{conda_env_path / 'bin'}:{env['PATH']}"
+        env["LD_LIBRARY_PATH"] = f"{conda_env_path / 'lib'}:/usr/lib/x86_64-linux-gnu:{env.get('LD_LIBRARY_PATH', '')}"
         env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
-        log_file = os.path.join(BASE_DIR, "synthesis_log.txt")
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Executing synthesis command: {' '.join(cmd)}\n")
+        # ---------- 9. 执行 ----------
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
 
-        try:
-            process = subprocess.run(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=60,
-                cwd=VITS_INFERENCE_DIR
-            )
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] STDOUT: {process.stdout}\n")
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] STDERR: {process.stderr}\n")
+        if proc.returncode == 0:
+            # 成功 → 返回相对 URL，前端直接拼接域名即可
+            audio_url = f"/user_outputs/{username}/{folder}/output/{output_filename}"
+            logger.info(f"合成成功 → {output_path}  URL: {audio_url}")
+            return jsonify({
+                "message": "语音合成成功",
+                "audio_url": audio_url
+            }), 200
+        else:
+            logger.error(f"合成失败 → {proc.stderr}")
+            return jsonify({
+                "code": 400,
+                "msg": "合成失败",
+                "raw_output": proc.stderr
+            }), 400
 
-            if process.returncode == 0:
-                audio_url = f"/outputs/{output_filename}"
-                return jsonify({"message": "语音合成成功", "audio_url": audio_url})
-            else:
-                error_msg = f"语音合成失败，退出码 {process.returncode}: {process.stderr}"
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
-                return jsonify({"code":400,"msg": error_msg, "raw_output": process.stderr}), 400
-        except subprocess.TimeoutExpired:
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 语音合成超时\n")
-            return jsonify({"code":400,"msg": "语音合成超时"}), 400
-        except Exception as e:
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 语音合成失败: {str(e)}\n")
-            return jsonify({"code":400,"msg": f"语音合成失败: {str(e)}"}), 400
+    except subprocess.TimeoutExpired:
+        return jsonify({"code": 400, "msg": "合成超时"}), 400
     except Exception as e:
-        return jsonify({"code":400,"msg": str(e)}), 400
-    
+        logger.exception("synthesize_speech error")
+        return jsonify({"code": 500, "msg": str(e)}), 500
+
+
+@app.route('/user_outputs/<username>/<folder>/output/<filename>')
+@cross_origin()
+def serve_user_audio(username, folder, filename):
+
+    user_output_root = USER_DATA_ROOT / username / folder / "output"
+    return send_from_directory(str(user_output_root), filename)   
+
+
+
+
 
 @app.route('/outputs/<filename>', methods=['GET'])
 @cross_origin()
@@ -1618,8 +1709,8 @@ def get_user():
 
 # 获取实验项目列表
 @app.route('/api/selprojects', methods=['POST'])
-@require_auth()
 @cross_origin()
+@require_auth()
 def get_projects():
     try:
         username = request.user['username']
@@ -1654,7 +1745,7 @@ def get_projects():
                     continue
 
         logger.info(f"[selprojects] 返回项目数: {len(result)}")
-        return jsonify(result)
+        return jsonify({"code": 200, "msg": "", "data": result})
     except Exception as e:
         logger.exception("[selprojects] 异常退出")
         return jsonify({"code": 400, "msg": str(e)}), 400
@@ -1725,25 +1816,23 @@ def get_projects():
     
 
 # 创建项目
-@app.route('/api/projects', methods=['POST'])
-@require_auth()
+@app.route('/api/addprojects', methods=['POST'])
 @cross_origin()
-# @require_auth('admin')
+@require_auth()
 def create_project():
     try:
         data = request.get_json()
-        account = data.get('account')
         name = data.get('name')
-        types = data.get('type')      # 英文
-        level = data.get('level')     # 英文
-        status = data.get('status')     # 英文
+        types = data.get('type')
+        level = data.get('level')
+        status = data.get('status') 
         description = data.get('description')
         
         if not all([name, types, level]):
             return jsonify({'code':400 ,'msg': '缺少必要字段'}), 400
         username   = request.user['username']
         print(f"username: {username}")
-        user_dir   = USER_DATA_ROOT / account
+        user_dir   = USER_DATA_ROOT / username
         user_dir.mkdir(parents=True, exist_ok=True)
         # 生成唯一项目 ID
         project_id = f"{uuid.uuid4().hex[:8]}"
@@ -1761,6 +1850,7 @@ def create_project():
             "e_name": name,
             "e_type": types,
             "e_level": level,
+            "e_status": status,
             "e_description": description,
             "e_banner": str(json_path),
             "e_list": []
@@ -1813,6 +1903,7 @@ def delete_project():
 
         project_id = data['project_id']
         username = request.user['username']
+        print(f"username: {username}")
         user_dir = USER_DATA_ROOT / username
         project_dir = user_dir / project_id
 
@@ -1829,27 +1920,37 @@ def delete_project():
 
     except Exception as e:
         logger.exception("delete_project error")
-        return jsonify({"code": 400, "msg": str(e)}), 400
+        return jsonify({"code": 404, "msg": str(e)}), 404
 
 # 保存指导书
-@app.route('/api/guides', methods=['POST'])
+@app.route('/api/saveguides', methods=['POST'])
 @cross_origin()
 @require_auth()
 def save_guide():
     try:
         data = request.get_json()
-        project_id = data.get('id')        # 项目 ID，如 4598e85c
+        project_id = data.get('id')
         title = data.get('title')
         purpose = data.get('purpose')
-        stepslist = data.get('stepslist', [])
 
+        stepslist = data.get('steplist') or []
+        if not isinstance(stepslist, list):
+            stepslist = []
+
+        print(f"stepslist: {stepslist}")
+        print(f"project_id: {project_id}")
+        print(f"title: {title}")
+        print(f"purpose: {purpose}")
         if not project_id or not stepslist:
-            return jsonify({"code": 400, "msg": '缺少必要字段：id 或 stepslist'}), 400
+            return jsonify({"code": 301, "msg": '缺少必要字段：id 或 stepslist'}), 301
 
         # 步骤转换
         stlist = []
         for idx, item in enumerate(stepslist, start=1):
-            key = item.get('key', str(idx))
+            # 确保 item 是 dict
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get('key', idx))
             value = item.get('value', '')
             stlist.append({
                 "id": key,
@@ -1864,9 +1965,10 @@ def save_guide():
             "stepsList": stlist
         }
 
-        # 安全路径：使用登录用户 + project_id
+        # 安全路径
         username = request.user['username']
-        user_root = Path("/data/huangtianle/Ai-Voice-Platform/object")  # 绝对路径！
+        print(f"username: {username}///{project_id}")
+        user_root = Path("/data/huangtianle/Ai-Voice-Platform/object")
         project_dir = user_root / username / project_id
         project_json_path = project_dir / f"project_{project_id}.json"
 
@@ -1877,17 +1979,13 @@ def save_guide():
             with open(project_json_path, 'r', encoding='utf-8') as f:
                 project_data = json.load(f)
         except Exception as e:
-            return jsonify({"code": 400, "msg": f'读取 project_{project_id}.json 失败: {e}'}), 400
+            return jsonify({"code": 404, "msg": f'读取 project_{project_id}.json 失败: {e}'}), 404
 
-        # 初始化 e_list
         if "e_list" not in project_data:
             project_data["e_list"] = []
 
-        # 追加或覆盖（建议：覆盖同 title 的，或直接追加）
-        # 这里采用：**追加模式**
         project_data["e_list"].append(guide_item)
 
-        # 写回 project.json
         try:
             with open(project_json_path, 'w', encoding='utf-8') as f:
                 json.dump(project_data, f, ensure_ascii=False, indent=2)
@@ -1907,6 +2005,7 @@ def save_guide():
 
 @app.route('/api/guides/<path:filename>')
 @cross_origin()
+@require_auth()
 def serve_guide(filename):
     return send_from_directory(GUIDE_DIR, filename)
 
