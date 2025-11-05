@@ -41,8 +41,9 @@ app = Flask(__name__)
 
 socketio = SocketIO(app, cors_allowed_origins="http://192.168.1.124:8082", logger=True)
 
+BASE_ROOT = Path(os.getenv("AI_VOICE_PLATFORM_ROOT", Path.home() / "Ai-Voice-Platform"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOCAL_MODEL_ROOT = "/data/huangtianle/Ai-Voice-Platform/models/ASR_train_models"
+LOCAL_MODEL_ROOT = str(BASE_ROOT / "models" / "ASR_train_models")
 MODEL_DIR = os.path.join(BASE_DIR, "models", "ASR_train_models")
 UPLOAD_DIR = os.path.join(BASE_DIR, "Uploads")
 OUTPUT_DIR = os.path.join(BASE_DIR, "VITS-fast-fine-tuning", "output")
@@ -57,7 +58,7 @@ VITS_INFERENCE_DIR = os.path.join(BASE_DIR, 'VITS-fast-fine-tuning')
 ALLOWED_MODEL_EXTENSIONS = {'pth'}
 ALLOWED_CONFIG_EXTENSIONS = {'json'}
 GUIDE_DIR = os.path.join(BASE_DIR, "Guides")
-USER_DATA_ROOT = Path("/data/huangtianle/Ai-Voice-Platform/object")
+USER_DATA_ROOT = BASE_ROOT / "object"
 
 STREAM_ASR_PROC = None          # 子进程句柄
 STREAM_ASR_LOCK = threading.Lock()
@@ -68,7 +69,7 @@ asr_process_killed = False
 asr_training_thread = None
 
 # 注册静态文件服务
-app.static_folder = "/data/huangtianle/Ai-Voice-Platform/static"
+app.static_folder = str(BASE_ROOT / "static")
 # ====== WebSocket 实时 ASR 推流新增 ======
 ASR_LOG_Q = queue.Queue()          # 留给前端轮询备用，可忽略
 STREAM_ASR_THREAD = None           # 读 stdout 线程句柄
@@ -516,7 +517,7 @@ def save_guide():
         # 安全路径
         username = request.user['username']
         print(f"username: {username}///{project_id}")
-        user_root = Path("/data/huangtianle/Ai-Voice-Platform/object")
+        user_root = BASE_ROOT / "object"
         project_dir = user_root / username / project_id
         project_json_path = project_dir / f"project_{project_id}.json"
 
@@ -565,7 +566,7 @@ def serve_guide(filename):
 def get_student_guide(project_id):
     try:
         username = request.user['username']
-        user_root = Path("/data/huangtianle/Ai-Voice-Platform/object")
+        user_root = BASE_ROOT / "object"
         project_json_path = user_root / username / project_id / f"project_{project_id}.json"
 
         if not project_json_path.exists():
@@ -586,7 +587,7 @@ def get_student_guide(project_id):
 # 获取学生IP
 @app.route('/api/student_ips', methods=['GET'])
 @cross_origin()
-@require_auth('admin')
+@require_auth()
 def get_student_ips():
     try:
         if not STUDENT_IPS_FILE.exists():
@@ -618,7 +619,7 @@ def distribute_project():
 
         # 读取当前用户项目文件
         current_user = request.user['username']
-        user_base = Path("/data/huangtianle/Ai-Voice-Platform/object") / current_user
+        user_base = BASE_ROOT / "object" / current_user
         project_file = user_base / project_id / f"project_{project_id}.json"
 
         if not project_file.exists():
@@ -696,7 +697,7 @@ def asr_finetune_upload():
         current_user = request.user['username']  # 从 JWT 获取
 
         # 动态路径：当前用户 / 项目ID / dataset
-        target_root = Path("/data/huangtianle/Ai-Voice-Platform/object") / current_user / safe_folder / "dataset"
+        target_root = BASE_ROOT / "object" / current_user / safe_folder / "dataset"
         target_root.mkdir(parents=True, exist_ok=True)
 
         if 'file' not in request.files:
@@ -751,7 +752,7 @@ def start_asr_train():
             return jsonify({"code": 400, "msg": f"模型文件夹不存在: {model_path}"}), 400
 
         # ---------- 项目目录 ----------
-        project_root = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder
+        project_root = BASE_ROOT / "object" / username / folder
         dataset_dir  = project_root / "dataset"
         if not dataset_dir.is_dir():
             return jsonify({"code": 400, "msg": "数据集目录不存在"}), 400
@@ -856,7 +857,7 @@ def stop_asr_training():
             return jsonify({"code": 400, "msg": "缺少 folder 参数"}), 400
 
         username = request.user['username']
-        project_root = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder
+        project_root = BASE_ROOT / "object" / username / folder
         base_model_dir = project_root / "model"
 
         # 3. 终止进程
@@ -968,24 +969,19 @@ def get_offline_models():
     try:
         folder = request.get_json().get('folder')
         if not folder:
-            return jsonify({"code": 400, "msg": "缺少 folder 参数"}), 400
-
+            return jsonify({"code": 300, "msg": "缺少 folder 参数", "data": []}), 300
         username = request.user.get('username')
         if not username:
-            return jsonify({"code": 401, "msg": "未登录"}), 401
-
-        model_dir = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder / "model"
+            return jsonify({"code": 301, "msg": "未登录", "data": []}), 301
+        model_dir = BASE_ROOT / "object" / username / folder / "model"
         if not model_dir.is_dir():
-            return jsonify({"code": 404, "msg": "模型目录不存在"}), 404
-
+            return jsonify({"code": 302, "msg": "模型目录不存在", "data": []}), 302
         models = [f.name for f in model_dir.iterdir() if f.is_dir()]
         logger.info(f"用户 {username} 查询离线模型: {folder} → {len(models)} 个")
-
-        return jsonify({"code": 200, "models": models}), 200
-
+        return jsonify({"code": 200,"msg": '加载成功', "data": models}), 200
     except Exception as e:
         logger.error(f"查询离线模型失败: {e}")
-        return jsonify({"code": 400, "msg": str(e)}), 400
+        return jsonify({"code": 404, "msg": str(e), "data": []}), 404
 
 # 离线音频上传
 @app.route('/api/offline_upload_audio', methods=['POST'])
@@ -1011,7 +1007,7 @@ def offline_upload_audio():
         username = request.user['username']
 
         # 目标目录
-        upload_dir = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder / "Uploads"
+        upload_dir = BASE_ROOT / "object" / username / folder / "Uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
 
         # 安全文件名 + uuid 防重名
@@ -1123,8 +1119,7 @@ def stream_asr_models():
         username = request.user.get('username')
         if not username:
             return jsonify({"code": 401, "msg": "未登录"}), 401
-
-        model_dir = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder / "model"
+        model_dir = BASE_ROOT / "object" / username / folder / "model"
         if not model_dir.is_dir():
             return jsonify({"code": 404, "msg": "模型目录不存在"}), 404
 
@@ -1651,7 +1646,7 @@ def speech_synthesize_models():
         if not username:
             return jsonify({"code": 401, "msg": "未登录"}), 401
 
-        model_dir = Path("/data/huangtianle/Ai-Voice-Platform/object") / username / folder / "model"
+        model_dir = BASE_ROOT / "object" / username / folder / "model"
         if not model_dir.is_dir():
             return jsonify({"code": 404, "msg": "模型目录不存在"}), 404
 
